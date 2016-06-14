@@ -215,8 +215,9 @@ LABEL: pg_basebackup base backup
         cursor.execute("CREATE TABLESPACE tstest LOCATION %s", [tspath])
         r_db, r_conn = None, None
         try:
-            cursor.execute("CREATE TABLE tstest (id BIGSERIAL PRIMARY KEY) TABLESPACE tstest")
-            cursor.execute("INSERT INTO tstest (id) VALUES (default)")
+            cursor.execute("CREATE TABLE tstest (id BIGSERIAL PRIMARY KEY, value BIGINT) TABLESPACE tstest")
+            cursor.execute("INSERT INTO tstest (value) SELECT * FROM generate_series(1, 1000)")
+            cursor.execute("CHECKPOINT")
             cursor.execute("SELECT oid, pg_tablespace_location(oid) FROM pg_tablespace WHERE spcname = 'tstest'")
             res = cursor.fetchone()
             assert res[1] == tspath

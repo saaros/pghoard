@@ -41,7 +41,12 @@ class TransferAgent(Thread):
                      "xlogs_since_basebackup": 0, "last_success": None}
 
             def defaults():
-                return {"basebackup": EMPTY.copy(), "xlog": EMPTY.copy(), "timeline": EMPTY.copy()}
+                return {
+                    "basebackup": EMPTY.copy(),
+                    "basebackup_chunk": EMPTY.copy(),
+                    "timeline": EMPTY.copy(),
+                    "xlog": EMPTY.copy(),
+                }
 
             self.state[site] = {
                 "upload": defaults(),
@@ -61,7 +66,11 @@ class TransferAgent(Thread):
 
     @staticmethod
     def form_key_path(file_to_transfer):
-        name = os.path.basename(file_to_transfer["local_path"])
+        name_parts = file_to_transfer["local_path"].split("/")
+        if file_to_transfer["filetype"] == "basebackup_chunk":
+            name = os.path.join(name_parts[-2], name_parts[-1])
+        else:
+            name = name_parts[-1]
         return os.path.join(file_to_transfer["path_prefix"],
                             file_to_transfer["site"],
                             file_to_transfer["filetype"],

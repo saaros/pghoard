@@ -7,6 +7,7 @@ See LICENSE for details
 from . import common, config, logutil, version
 from .patchedtarfile import tarfile
 from .postgres_command import PGHOARD_HOST, PGHOARD_PORT
+from concurrent import futures
 from pghoard.rohmu import compat, get_transfer, IO_BLOCK_SIZE, rohmufile
 from pghoard.rohmu.errors import Error, InvalidConfigurationError
 from psycopg2.extensions import adapt
@@ -14,11 +15,13 @@ from requests import Session
 import argparse
 import datetime
 import dateutil.parser
+import io
 import json
 import logging
 import os
 import re
 import shutil
+import statistics
 import sys
 import tempfile
 
@@ -236,9 +239,8 @@ class Restore:
         print("\nSelecting {!r} for restore".format(selected))
         return selected
 
-    def _extract_pghoard_bb_v1(self, fileobj, pgdata, tablespaces):
+    def _extract_pghoard_bb_v1(self, fileobj, pgdata, tablespaces, tar_meta):
         directories = []
-        tar_meta = None
         # | in mode to use tarfile's internal stream buffer manager, currently required because our SnappyFile
         # interface doesn't do proper buffering for reads
         with tarfile.open(fileobj=fileobj, mode="r|", bufsize=IO_BLOCK_SIZE) as tar:
@@ -260,6 +262,8 @@ class Restore:
                     if len(tscomponents) == 2 and tarinfo.isdir():
                         # Create tablespace entry
                         assert tar_meta["tablespaces"][tsname]["oid"] == tablespaces[tsname]["oid"]
+                        tblspc_dir = os.path.join(pgdata, "pg_tblspc")
+                        os.makedirs(tblspc_dir, exist_ok=True)
                         linkname = os.path.join(pgdata, "pg_tblspc", str(tablespaces[tsname]["oid"]))
                         os.symlink(tspath, linkname)
                         directories.append([tspath, tarinfo])
@@ -321,6 +325,7 @@ class Restore:
 
         # Grab basebackup metadata to make sure it exists and to look up tablespace requirements
         metadata = self.storage.get_basebackup_metadata(basebackup)
+        tablespaces = {}
 
         # Make sure we have a proper place to write the $PGDATA and possible tablespaces
         dirs_to_create = []
@@ -339,15 +344,46 @@ class Restore:
             raise RestoreError("$PGDATA target directory {!r} exists, is not empty and --overwrite not specified, aborting."
                                .format(pgdata))
 
-        tablespaces = {}
-        tsmetare = re.compile("^tablespace-name-([0-9]+)$")
-        for kw, value in metadata.items():
-            match = tsmetare.match(kw)
-            if not match:
-                continue
-            tsoid = match.group(1)
-            tsname = value
-            tspath = tablespace_mapping.pop(tsname, metadata["tablespace-path-{}".format(tsoid)])
+        bmeta = None
+        if metadata.get("format") == "pghoard-v1-bmeta":
+            # "Backup file" is a metadata object, fetch it to get more information
+            bmeta_compressed = self.storage.get_file_bytes(basebackup)
+            with rohmufile.file_reader(fileobj=io.BytesIO(bmeta_compressed), metadata=metadata,
+                                       key_lookup=config.key_lookup_for_site(self.config, site)) as input_obj:
+                bmeta_bytes = input_obj.read()
+
+            bmeta = json.loads(bmeta_bytes.decode("utf-8"))
+            tablespaces = bmeta["tablespaces"]
+
+            basebackup_data_files = [
+                os.path.join(site, "basebackup_chunk", chunk[0])
+                for chunk in bmeta["chunks"]
+            ]
+
+        elif metadata.get("format") == "pghoard-bb-v1":
+            # Tablespace information stored in object store metadata, look it up
+            tsmetare = re.compile("^tablespace-name-([0-9]+)$")
+            for kw, value in metadata.items():
+                match = tsmetare.match(kw)
+                if not match:
+                    continue
+                tsoid = match.group(1)
+                tsname = value
+                tspath = metadata["tablespace-path-{}".format(tsoid)]
+                tablespaces[tsname] = {
+                    "oid": int(tsoid),
+                    "path": tspath,
+                }
+
+            basebackup_data_files = [basebackup]
+
+        else:
+            # Object is a raw (encrypted, compressed) basebackup
+            basebackup_data_files = [basebackup]
+
+        # Map tablespaces as requested and make sure the directories exist
+        for tsname, tsinfo in tablespaces.items():
+            tspath = tablespace_mapping.pop(tsname, tsinfo["path"])
             if not os.path.exists(tspath):
                 raise RestoreError("Tablespace {!r} target directory {!r} does not exist, aborting."
                                    .format(tsname, tspath))
@@ -356,11 +392,8 @@ class Restore:
                 raise RestoreError("Tablespace {!r} target directory {!r} exists but is not empty, aborting."
                                    .format(tsname, tspath))
 
+            tsinfo["path"] = tspath
             print("Using existing empty directory {!r} for tablespace {!r}".format(tspath, tsname))
-            tablespaces[tsname] = {
-                "oid": int(tsoid),
-                "path": tspath,
-            }
             dirs_to_recheck.append(["Tablespace {!r}".format(tsname), tspath])
 
         # We .pop() the elements of tablespace_mapping above - if mappings are given they must all exist or the
@@ -384,20 +417,49 @@ class Restore:
             os.makedirs(dirname)
             os.chmod(dirname, 0o700)
 
-        def download_progress(current_pos, expected_max, end=""):
-            print("\rDownload progress: {:.2%}".format(current_pos / expected_max), end=end)
+        with futures.ThreadPoolExecutor(max_workers=8) as extract_executor:
+            extract_jobs = []
+            with futures.ThreadPoolExecutor(max_workers=8) as download_executor:
+                download_progress_per_file = {basebackup_data_file: 0 for basebackup_data_file in basebackup_data_files}
+                download_jobs = []
 
-        with tempfile.TemporaryFile(dir=self.config["backup_location"], prefix="basebackup.", suffix=".pghoard") as tmp:
-            self.storage.get_basebackup_file_to_fileobj(basebackup, tmp, progress_callback=download_progress)
-            download_progress(1, 1, end="\n")
-            tmp.seek(0)
+                def download_progress(end=""):
+                    mean_prog = statistics.mean(download_progress_per_file.values())
+                    print("\rDownload progress: {:.2%}".format(mean_prog), end=end)
 
-            with rohmufile.file_reader(fileobj=tmp, metadata=metadata,
-                                       key_lookup=config.key_lookup_for_site(self.config, site)) as input_obj:
-                if metadata.get("format") == "pghoard-bb-v1":
-                    self._extract_pghoard_bb_v1(input_obj, pgdata, tablespaces)
-                else:
-                    self._extract_basic(input_obj, pgdata)
+                for basebackup_data_file in basebackup_data_files:
+                    def single_download_progress(current_pos, expected_max):
+                        download_progress_per_file[basebackup_data_file] = current_pos / expected_max
+                        download_progress()
+
+                    download_jobs.append(download_executor.submit(
+                        self.download_one_backup,
+                        basebackup_data_file=basebackup_data_file,
+                        progress_callback=single_download_progress,
+                        site=site,
+                    ))
+
+                for future in futures.as_completed(download_jobs):
+                    if future.exception():
+                        self.log.error("Got error from chunk download: %s", future.exception())
+                        continue
+
+                    extract_jobs.append(extract_executor.submit(
+                        self.extract_one_backup,
+                        item=future.result(),
+                        bmeta=bmeta,
+                        pgdata=pgdata,
+                        site=site,
+                        tablespaces=tablespaces,
+                    ))
+
+                download_progress(end="\n")
+
+            for future in futures.as_completed(extract_jobs):
+                if future.exception():
+                    self.log.error("Got error from chunk extraction: %s", future.exception())
+                    continue
+                pass
 
         create_recovery_conf(
             dirpath=pgdata,
@@ -416,6 +478,32 @@ class Restore:
         print("You can start PostgreSQL by running pg_ctl -D %s start" % pgdata)
         print("On systemd based systems you can run systemctl start postgresql")
         print("On SYSV Init based systems you can run /etc/init.d/postgresql start")
+
+    def download_one_backup(self, *, basebackup_data_file, progress_callback, site):
+        dl_dir = os.path.join(self.config["backup_location"], self.config["path_prefix"], site, "basebackup_incoming")
+        compat.makedirs(dl_dir, exist_ok=True)
+        tmp = tempfile.NamedTemporaryFile(dir=dl_dir, prefix="basebackup.", suffix=".pghoard")
+        metadata = self.storage.get_basebackup_file_to_fileobj(
+            basebackup=basebackup_data_file,
+            fileobj=tmp,
+            progress_callback=progress_callback)
+        progress_callback(1, 1)
+        self.log.info("Downloaded %r", basebackup_data_file)
+        tmp.seek(0)
+        return tmp, metadata
+
+    def extract_one_backup(self, *, item, bmeta, pgdata, site, tablespaces):
+        tmp, metadata = item
+        with tmp:
+            with rohmufile.file_reader(fileobj=tmp, metadata=metadata,
+                                       key_lookup=config.key_lookup_for_site(self.config, site)) as input_obj:
+                if metadata.get("format") in ("pghoard-bb-v1", "pghoard-v1-bdata"):
+                    self._extract_pghoard_bb_v1(input_obj, pgdata, tablespaces, bmeta)
+                elif not metadata.get("format"):
+                    self._extract_basic(input_obj, pgdata)
+                else:
+                    raise RestoreError("Unrecognized basebackup format {!r}".format(metadata.get("format")))
+        self.log.info("Extracted %r", tmp)
 
     def run(self, args=None):
         parser = self.create_parser()
@@ -451,7 +539,10 @@ class ObjectStore:
         return self.storage.get_metadata_for_key(basebackup)
 
     def get_basebackup_file_to_fileobj(self, basebackup, fileobj, *, progress_callback=None):
-        self.storage.get_contents_to_fileobj(basebackup, fileobj, progress_callback=progress_callback)
+        return self.storage.get_contents_to_fileobj(basebackup, fileobj, progress_callback=progress_callback)
+
+    def get_file_bytes(self, name):
+        return self.storage.get_contents_to_string(name)[0]
 
 
 class HTTPRestore(ObjectStore):

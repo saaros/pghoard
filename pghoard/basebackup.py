@@ -14,8 +14,11 @@ from .common import (
     terminate_subprocess,
 )
 from .patchedtarfile import tarfile
+from concurrent import futures
+from functools import partial
 from pghoard.rohmu import errors, rohmufile
 from pghoard.rohmu.compat import suppress
+from queue import Queue
 from tempfile import NamedTemporaryFile
 from threading import Thread
 import datetime
@@ -407,20 +410,67 @@ class PGBaseBackup(Thread):
             yield archive_path, local_path, False
             yield from add_directory(archive_path, local_path, missing_ok=False)
 
+    def tar_one_file(self, *, temp_dir, chunk_name, files_to_backup, file_writer, log_func, init_func=None, close_func=None):
+        start_time = time.monotonic()
+
+        with NamedTemporaryFile(dir=temp_dir, prefix=os.path.basename(chunk_name), suffix=".tmp") as raw_output_obj:
+            with file_writer(fileobj=raw_output_obj) as output_obj:
+                with tarfile.TarFile(fileobj=output_obj, mode="w") as output_tar:
+                    if init_func:
+                        init_func(tar=output_tar)
+                    self.write_files_to_tar(files=files_to_backup, tar=output_tar)
+                    if close_func:
+                        close_func(tar=output_tar)
+
+                input_size = output_obj.tell()
+
+            result_size = raw_output_obj.tell()
+            os.link(raw_output_obj.name, chunk_name)
+
+        log_func(
+            elapsed=time.monotonic() - start_time,
+            original_size=input_size,
+            result_size=result_size,
+            source_name="({} $PGDATA files)".format(len(files_to_backup)),
+        )
+
+        return chunk_name, input_size, result_size
+
     def run_local_tar_basebackup(self):
         pgdata = self.config["backup_sites"][self.site]["pg_data_directory"]
         if not os.path.isdir(pgdata):
             raise errors.InvalidConfigurationError("pg_data_directory {!r} does not exist".format(pgdata))
 
-        temp_basebackup_dir, compressed_basebackup = self.get_paths_for_backup(self.basebackup_path)
+        temp_base_dir, compressed_base = self.get_paths_for_backup(self.basebackup_path)
+        os.makedirs(compressed_base)
+        meta_file = "{}.bmeta.pghoard".format(compressed_base)
+        data_file_format = "{}/{}.{{:04x}}.bdata.pghoard".format(compressed_base, os.path.basename(compressed_base)).format
+        chunk_files = []
 
         compression_algorithm = self.config["compression"]["algorithm"]
         compression_level = self.config["compression"]["level"]
+        # Default to 2GB chunks of uncompressed data
+        target_chunk_size = self.config["backup_sites"][self.site].get("basebackup_chunk_size") or (1024 * 1024 * 1024 * 2)
 
         rsa_public_key = None
         encryption_key_id = self.config["backup_sites"][self.site]["encryption_key_id"]
         if encryption_key_id:
             rsa_public_key = self.config["backup_sites"][self.site]["encryption_keys"][encryption_key_id]["public"]
+
+        file_writer = partial(
+            rohmufile.file_writer,
+            compression_algorithm=compression_algorithm,
+            compression_level=compression_level,
+            rsa_public_key=rsa_public_key,
+        )
+
+        log_func = partial(
+            rohmufile.log_compression_result,
+            encrypted=True if rsa_public_key else False,
+            log_func=self.log.info,
+        )
+
+        chunk_callback_queue = Queue()
 
         self.log.debug("Connecting to database to start backup process")
         connection_string = connection_string_using_pgpass(self.connection_info)
@@ -428,6 +478,9 @@ class PGBaseBackup(Thread):
             cursor = db_conn.cursor()
             cursor.execute("SELECT pg_start_backup(%s)", [BASEBACKUP_NAME])
             try:
+                with open(os.path.join(pgdata, "backup_label"), "rb") as fp:
+                    label_data = fp.read()
+
                 # Look up tablespaces and resolve their current filesystem locations
                 cursor.execute("SELECT oid, spcname FROM pg_tablespace WHERE spcname NOT IN ('pg_default', 'pg_global')")
                 tablespaces = {
@@ -439,58 +492,132 @@ class PGBaseBackup(Thread):
                 }
                 db_conn.commit()
 
-                with open(os.path.join(pgdata, "backup_label"), "rb") as fp:
-                    start_wal_segment, backup_start_time = self.parse_backup_label(fp.read())
-
-                self.log.info("Starting to backup %r to %r", pgdata, compressed_basebackup)
+                self.log.info("Starting to backup %r and %r tablespaces to %r",
+                              pgdata, len(tablespaces), compressed_base)
                 start_time = time.monotonic()
-                with NamedTemporaryFile(dir=temp_basebackup_dir, prefix="data.", suffix=".tmp-compress") as raw_output_obj:
-                    with rohmufile.file_writer(fileobj=raw_output_obj,
-                                               compression_algorithm=compression_algorithm,
-                                               compression_level=compression_level,
-                                               rsa_public_key=rsa_public_key) as output_obj:
-                        with tarfile.TarFile(fileobj=output_obj, mode="w") as output_tar:
-                            self.write_init_entries_to_tar(pgdata=pgdata, tablespaces=tablespaces, tar=output_tar)
-                            files = self.find_files_to_backup(pgdata=pgdata, tablespaces=tablespaces)  # NOTE: generator
-                            self.write_files_to_tar(files=files, tar=output_tar)
-                            self.write_final_entries_to_tar(pgdata=pgdata, tar=output_tar)
-                        input_size = output_obj.tell()
+                total_file_count = 0
 
-                    os.link(raw_output_obj.name, compressed_basebackup)
-                    result_size = raw_output_obj.tell()
+                with futures.ThreadPoolExecutor(max_workers=8) as tex:
+                    chunk_no = [0]
+                    jobs = []
+                    this_chunk_size = 0
+                    this_chunk_files = []
 
-                rohmufile.log_compression_result(
-                    elapsed=time.monotonic() - start_time,
-                    encrypted=True if rsa_public_key else False,
-                    log_func=self.log.info,
-                    original_size=input_size,
-                    result_size=result_size,
-                    source_name=pgdata,
-                )
+                    def dispatch_chunk(final=False):
+                        chunk_name = data_file_format(chunk_no[0])
+                        init_func, final_func = None, None
+                        if chunk_no[0] == 0:
+                            init_func = partial(self.write_init_entries_to_tar, pgdata=pgdata, tablespaces=tablespaces)
+                        if final:
+                            final_func = partial(self.write_final_entries_to_tar, pgdata=pgdata)
+                        jobs.append(tex.submit(
+                            self.tar_one_file,
+                            chunk_name=chunk_name,
+                            temp_dir=temp_base_dir,
+                            files_to_backup=this_chunk_files,
+                            file_writer=file_writer,
+                            log_func=log_func,
+                            init_func=init_func,
+                            close_func=final_func,
+                        ))
+                        chunk_no[0] += 1
+
+                    for archive_path, local_path in self.find_files_to_backup(pgdata=pgdata, tablespaces=tablespaces):
+                        file_size = os.path.getsize(local_path)
+
+                        # Switch chunks if the current chunk has at least 20% data and the new chunk would tip it over
+                        if this_chunk_size > target_chunk_size / 5 and this_chunk_size + file_size > target_chunk_size:
+                            dispatch_chunk()
+                            this_chunk_size = 0
+                            this_chunk_files = []
+
+                        total_file_count += 1
+                        this_chunk_size += file_size
+                        this_chunk_files.append([archive_path, local_path])
+
+                    dispatch_chunk(final=True)
+
+                    for future in futures.as_completed(jobs):
+                        if future.exception():
+                            self.log.error("Got error: %r from chunk generation", future.exception())
+                            continue
+
+                        # chunk name in metadata includes the parent directory (ie backup "name")
+                        chunk_path, input_size, output_size = future.result()
+                        chunk_files.append(["/".join(chunk_path.split("/")[-2:]), input_size, output_size])
+                        self.log.info("Chunk generation complete: %r", chunk_files[-1])
+
+                        self.transfer_queue.put({
+                            "callback_queue": chunk_callback_queue,
+                            "file_size": output_size,
+                            "filetype": "basebackup_chunk",
+                            "local_path": chunk_path,
+                            "metadata": {
+                                "compression-algorithm": compression_algorithm,
+                                "encryption-key-id": encryption_key_id,
+                                "format": "pghoard-v1-bdata",
+                                "original-file-size": input_size,
+                            },
+                            "site": self.site,
+                            "type": "UPLOAD",
+                        })
+
+                total_input_size = sum(item[1] for item in chunk_files)
+                total_output_size = sum(item[2] for item in chunk_files)
+
+                self.log.info("Basebackup generation finished, %r files, %r chunks, "
+                              "%r byte input, %r byte output, took %r seconds, waiting to upload",
+                              total_file_count, len(chunk_files),
+                              total_input_size, total_output_size, time.monotonic() - start_time)
+
             finally:
                 db_conn.rollback()
                 cursor.execute("SELECT pg_stop_backup()")
                 db_conn.commit()
 
-        metadata = {
-            "compression-algorithm": compression_algorithm,
-            "encryption-key-id": encryption_key_id,
-            "format": "pghoard-bb-v1",
-            "original-file-size": input_size,
-            "pg-version": self.pg_version_server,
-            "start-time": backup_start_time,
-            "start-wal-segment": start_wal_segment,
+        # wait for chunk transfer to finish
+        # TODO: timeout?
+        upload_results = []
+        while len(upload_results) < len(chunk_files):
+            upload_results.append(chunk_callback_queue.get())
+
+        self.log.info("Basebackup chunk upload finished")
+
+        # TODO: check upload results
+        # TODO: wipe chunks on error
+
+        start_wal_segment, backup_start_time = self.parse_backup_label(label_data)
+        bmeta = {
+            "backup_start_time": backup_start_time,
+            "chunks": chunk_files,
+            "pgdata": pgdata,
+            "pghoard_object": "basebackup",
+            "pghoard_version": version.__version__,
+            "start_wal_segment": start_wal_segment,
+            "tablespaces": tablespaces,
         }
-        for spcname, spcinfo in tablespaces.items():
-            metadata["tablespace-name-{}".format(spcinfo["oid"])] = spcname
-            metadata["tablespace-path-{}".format(spcinfo["oid"])] = spcinfo["path"]
+        bmeta_io = io.BytesIO()
+        with file_writer(fileobj=bmeta_io) as output_obj:
+            output_obj.write(json.dumps(bmeta).encode("utf-8"))
+        bmeta_data = bmeta_io.getbuffer()
 
         self.transfer_queue.put({
+            "blob": bmeta_data,
             "callback_queue": self.callback_queue,
-            "file_size": result_size,
+            "file_size": len(bmeta_data),
             "filetype": "basebackup",
-            "local_path": compressed_basebackup,
-            "metadata": metadata,
+            "local_path": meta_file,
+            "metadata": {
+                "compression-algorithm": compression_algorithm,
+                "encryption-key-id": encryption_key_id,
+                "format": "pghoard-v1-bmeta",
+                "original-file-size": input_size,
+                "pg-version": self.pg_version_server,
+                "start-time": backup_start_time,
+                "start-wal-segment": start_wal_segment,
+                "total-input-size": total_input_size,
+                "total-output-size": total_output_size,
+            },
             "site": self.site,
             "type": "UPLOAD",
         })
