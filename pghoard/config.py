@@ -81,13 +81,22 @@ def set_and_check_config_defaults(config, *, check_commands=True, check_pgdata=T
         site_config.setdefault("basebackup_chunk_size", 1024 * 1024 * 1024 * 2)
         site_config.setdefault("basebackup_chunks_in_progress", 5)
         site_config.setdefault("basebackup_count", 2)
-        site_config.setdefault("basebackup_interval_hours", 24)
         # NOTE: stream_compression removed from documentation after 1.6.0 release
         site_config.setdefault("basebackup_mode",
                                "pipe" if site_config.get("stream_compression") else "basic")
         site_config.setdefault("encryption_key_id", None)
         site_config.setdefault("object_storage", None)
         site_config.setdefault("prefix", os.path.join(config["path_prefix"], site_name))
+
+        # Backup scheduling, either a number of hours or a cron-like format
+        if "basebackup_schedule" in site_config:
+            if isinstance(site_config["basebackup_schedule"], str):
+                site_config["basebackup_schedule"] = parse_schedule(site_config["basebackup_schedule"])
+            # Check minimum number of hours between backups.  Subtract one hour to avoid drifting.
+            schedule_interval = minimum_schedule_interval(site_config["basebackup_schedule"])
+            site_config["basebackup_interval_hours"] = max(1, schedule_interval - 1)
+        else:
+            site_config.setdefault("basebackup_interval_hours", 24)
 
         # NOTE: pg_data_directory doesn't have a default value
         data_dir = site_config.get("pg_data_directory")
@@ -190,3 +199,71 @@ def key_lookup_for_site(config, site):
         return config["backup_sites"][site]["encryption_keys"][key_id]["private"]
 
     return key_lookup
+
+
+def parse_schedule_range(*, spec, min, max, name_map=None):
+    """Parse a single range from cron-like format, e.g. `2,4,5,6` or `*/2`"""
+    def parse_value(value):
+        if name_map and value.lower() in name_map:
+            return name_map[value.lower()]
+        return int(value)
+    if spec[0] == "*":
+        spec = f"{min}-{max}{spec[1:]}"
+    spec, _, step = spec.partition("/")
+    step = int(step or 1)
+    values = set()
+    for value in spec.split(","):
+        if "-" in value:
+            value_start, value_end = value.split("-", 1)
+            value_start = parse_value(value_start)
+            value_end = parse_value(value_end)
+            values.update(range(value_start, value_end + 1, step))
+        else:
+            values.add(parse_value(value))
+    return sorted(values)
+
+
+def parse_schedule(schedule):
+    """Parse a cron-like schedule"""
+    dow_map = {"mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6, "sun": 0, "7": 0}
+
+    try:
+        minute, hour, dom, month, dow = schedule.split()
+    except ValueError:
+        raise ValueError("Schedule must be in 'minute hour day-of-month month day-of-week' format") from None
+    if minute != "*":
+        raise ValueError("Schedule minute must be set to '*'")
+    if month != "*":
+        raise ValueError("Schedule month must be set to '*'")
+
+    hours = parse_schedule_range(spec=hour, min=0, max=23)
+    days_of_month = parse_schedule_range(spec=dom, min=1, max=31)
+    days_of_week = parse_schedule_range(spec=dow, min=0, max=6)
+
+    return {
+        "hours": hours,
+        "days_of_month": days_of_month,
+        "days_of_week": days_of_week,
+    }
+
+
+def minimum_schedule_interval(schedule):
+    """Find the lowest hourly interval (or 24h) from schedule"""
+    if len(schedule["hours"]) == 1:
+        return 24
+    last_val = 1
+    for day in schedule["days_of_month"]:
+        if day - last_val > 1:
+            return 24
+        last_val = day
+    last_val = 0
+    for day in schedule["days_of_week"]:
+        if day - last_val > 1:
+            return 24
+        last_val = day
+    min_hours = 24
+    last_val = schedule["hours"][-1]
+    for hour in schedule["hours"]:
+        min_hours = min(min_hours, (hour - last_val) % 24)
+        last_val = hour
+    return min_hours

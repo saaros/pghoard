@@ -465,11 +465,18 @@ class PGHoard:
             self.log.info("Creating a new basebackup for %r because there are currently none", site)
             new_backup_needed = True
         else:
-            delta_since_last_backup = datetime.datetime.now(datetime.timezone.utc) - self.time_of_last_backup[site]
+            now = datetime.datetime.now(datetime.timezone.utc)
+            delta_since_last_backup = now - self.time_of_last_backup[site]
             if delta_since_last_backup >= datetime.timedelta(hours=site_config["basebackup_interval_hours"]):
-                self.log.info("Creating a new basebackup for %r by schedule (%s from previous)",
-                              site, delta_since_last_backup)
-                new_backup_needed = True
+                if "basebackup_schedule" not in site_config:
+                    new_backup_needed = True
+                elif now.hour in site_config["basebackup_schedule"]["hours"] and \
+                        now.day in site_config["basebackup_schedule"]["days_of_month"] and \
+                        now.weekday() in site_config["basebackup_schedule"]["days_of_week"]:
+                    new_backup_needed = True
+                if new_backup_needed:
+                    self.log.info("Creating a new basebackup for %r by schedule (%s from previous)",
+                                  site, delta_since_last_backup)
 
         if new_backup_needed and not os.path.exists(self.config["maintenance_mode_file"]):
             self.basebackups_callbacks[site] = Queue()
